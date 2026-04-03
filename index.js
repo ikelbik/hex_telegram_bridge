@@ -44,26 +44,60 @@ function tgPost(method, payload) {
 
 function verifyInitData(initData) {
   if (!initData) return { ok: false, error: 'init_data_empty' };
+  const token = BOT_TOKEN.trim();
+  if (!token) return { ok: false, error: 'bot_token_missing' };
+
   const params = new URLSearchParams(initData);
   const hash = params.get('hash');
   if (!hash) return { ok: false, error: 'hash_missing' };
+
+  // Try both with and without 'signature' field (Telegram sometimes includes it)
+  for (const skipSig of [true, false]) {
+    const p = new URLSearchParams(initData);
+    p.delete('hash');
+    if (skipSig) p.delete('signature');
+
+    const entries = [...p.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    const checkStr = entries.map(([k, v]) => `${k}=${v}`).join('\n');
+
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(token).digest();
+    const calcHash = crypto.createHmac('sha256', secretKey).update(checkStr).digest('hex');
+
+    if (calcHash === hash) {
+      const authDate = parseInt(p.get('auth_date') || '0', 10);
+      const now = Math.floor(Date.now() / 1000);
+      if (authDate <= 0 || (now - authDate) > 86400 * 30) return { ok: false, error: 'auth_expired' };
+      return { ok: true };
+    }
+  }
+
+  return { ok: false, error: 'signature_invalid' };
+}
+
+// Temporary debug endpoint — remove after fixing
+app.post('/debug_verify', (req, res) => {
+  const token = BOT_TOKEN.trim();
+  const initData = req.body.telegram_init_data || req.headers['x-telegram-init-data'] || '';
+  if (!initData) return res.json({ error: 'no_init_data' });
+
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
   params.delete('hash');
   params.delete('signature');
-
-  const entries = [...params.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const entries = [...params.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   const checkStr = entries.map(([k, v]) => `${k}=${v}`).join('\n');
-
-  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+  const secretKey = crypto.createHmac('sha256', 'WebAppData').update(token).digest();
   const calcHash = crypto.createHmac('sha256', secretKey).update(checkStr).digest('hex');
 
-  if (calcHash !== hash) return { ok: false, error: 'signature_invalid' };
-
-  const authDate = parseInt(params.get('auth_date') || '0', 10);
-  const now = Math.floor(Date.now() / 1000);
-  if (authDate <= 0 || (now - authDate) > 86400 * 30) return { ok: false, error: 'auth_expired' };
-
-  return { ok: true };
-}
+  res.json({
+    hash_from_tg: hash,
+    hash_computed: calcHash,
+    match: calcHash === hash,
+    token_length: token.length,
+    token_first4: token.slice(0, 4),
+    check_str_preview: checkStr.slice(0, 200),
+  });
+});
 
 function getInitData(req) {
   return (req.body && req.body.telegram_init_data)
