@@ -7,6 +7,7 @@ app.use(express.json());
 
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const BRIDGE_SECRET = process.env.BRIDGE_SECRET || '';
 const BOOST_STAR_PRICES = [1, 2, 3, 5];
 
 // Offset state (in-memory; Railway restarts reset it, which is fine)
@@ -16,7 +17,7 @@ let tgOffset = 0;
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Telegram-Init-Data');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Telegram-Init-Data, X-Bridge-Secret');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -105,6 +106,11 @@ function getInitData(req) {
     || '';
 }
 
+function verifyBridgeSecret(req) {
+  if (!BRIDGE_SECRET) return true;
+  return req.headers['x-bridge-secret'] === BRIDGE_SECRET;
+}
+
 // ── POST /create_invoice ──────────────────────────────────────────────────────
 app.post('/create_invoice', async (req, res) => {
   if (!BOT_TOKEN) return res.status(500).json({ success: false, error: 'BOT_TOKEN_not_set' });
@@ -168,6 +174,45 @@ app.post('/answer_precheckout', async (req, res) => {
     res.json({ ok: true, answered, updates: updates.result.length });
   } catch (e) {
     res.status(500).json({ ok: false, error: 'request_failed', details: e.message });
+  }
+});
+
+// ── POST /send_message ────────────────────────────────────────────────────────
+app.post('/send_message', async (req, res) => {
+  if (!BOT_TOKEN) return res.status(500).json({ success: false, error: 'BOT_TOKEN_not_set' });
+  if (!verifyBridgeSecret(req)) {
+    return res.status(401).json({ success: false, error: 'bridge_secret_invalid' });
+  }
+
+  const chatId = req.body.chat_id;
+  const text = typeof req.body.text === 'string' ? req.body.text : '';
+  if (!chatId) return res.status(422).json({ success: false, error: 'chat_id_required' });
+  if (!text) return res.status(422).json({ success: false, error: 'text_required' });
+
+  const payload = {
+    chat_id: chatId,
+    text,
+    parse_mode: typeof req.body.parse_mode === 'string' ? req.body.parse_mode : 'HTML',
+  };
+  if (req.body.reply_markup && typeof req.body.reply_markup === 'object') {
+    payload.reply_markup = req.body.reply_markup;
+  }
+  if (typeof req.body.disable_web_page_preview === 'boolean') {
+    payload.disable_web_page_preview = req.body.disable_web_page_preview;
+  }
+
+  try {
+    const result = await tgPost('sendMessage', payload);
+    if (!result.ok) {
+      return res.status(500).json({
+        success: false,
+        error: 'telegram_error',
+        description: result.description,
+      });
+    }
+    res.json({ success: true, result: result.result });
+  } catch (e) {
+    res.status(500).json({ success: false, error: 'request_failed', details: e.message });
   }
 });
 
