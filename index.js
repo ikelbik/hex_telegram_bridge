@@ -9,9 +9,10 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const BRIDGE_SECRET = process.env.BRIDGE_SECRET || '';
 const BOOST_STAR_PRICES = [1, 2, 3, 5];
+const APP_BOT_TOKENS = loadAppBotTokens();
 
-// Offset state (in-memory; Railway restarts reset it, which is fine)
-let tgOffset = 0;
+// Offset state per bot/app (in-memory; Railway restarts reset it, which is fine)
+const tgOffsets = new Map();
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -23,12 +24,67 @@ app.use((req, res, next) => {
 });
 
 // ── helpers ───────────────────────────────────────────────────────────────────
-function tgPost(method, payload) {
+function loadAppBotTokens() {
+  const map = new Map();
+  if (BOT_TOKEN.trim()) {
+    map.set('default', BOT_TOKEN.trim());
+  }
+
+  const envPairs = [
+    ['hexdrop', process.env.BOT_TOKEN_HEXDROP || ''],
+    ['condor', process.env.BOT_TOKEN_CONDOR || ''],
+  ];
+  for (const [appKey, token] of envPairs) {
+    if (token && token.trim()) {
+      map.set(appKey, token.trim());
+    }
+  }
+
+  const jsonRaw = process.env.APP_BOT_TOKENS_JSON || '';
+  if (jsonRaw.trim()) {
+    try {
+      const parsed = JSON.parse(jsonRaw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        for (const [appKey, token] of Object.entries(parsed)) {
+          if (typeof appKey === 'string' && typeof token === 'string' && token.trim()) {
+            map.set(appKey.trim().toLowerCase(), token.trim());
+          }
+        }
+      }
+    } catch {}
+  }
+
+  return map;
+}
+
+function getAppKey(req) {
+  const raw = typeof req.body?.app === 'string'
+    ? req.body.app
+    : typeof req.query?.app === 'string'
+      ? req.query.app
+      : '';
+  const appKey = raw.trim().toLowerCase();
+  return appKey || 'default';
+}
+
+function getBotTokenForApp(appKey) {
+  return APP_BOT_TOKENS.get(appKey) || '';
+}
+
+function getOffsetForApp(appKey) {
+  return tgOffsets.has(appKey) ? tgOffsets.get(appKey) : 0;
+}
+
+function setOffsetForApp(appKey, nextOffset) {
+  tgOffsets.set(appKey, Math.max(0, Number(nextOffset) || 0));
+}
+
+function tgPost(method, payload, botToken) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
     const req = https.request({
       hostname: 'api.telegram.org',
-      path: `/bot${BOT_TOKEN}/${method}`,
+      path: `/bot${botToken}/${method}`,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, (res) => {
@@ -43,9 +99,9 @@ function tgPost(method, payload) {
   });
 }
 
-function verifyInitData(initData) {
+function verifyInitData(initData, botToken) {
   if (!initData) return { ok: false, error: 'init_data_empty' };
-  const token = BOT_TOKEN.trim();
+  const token = String(botToken || '').trim();
   if (!token) return { ok: false, error: 'bot_token_missing' };
 
   const params = new URLSearchParams(initData);
@@ -77,7 +133,8 @@ function verifyInitData(initData) {
 
 // Temporary debug endpoint — remove after fixing
 app.post('/debug_verify', (req, res) => {
-  const token = BOT_TOKEN.trim();
+  const appKey = getAppKey(req);
+  const token = getBotTokenForApp(appKey).trim();
   const initData = req.body.telegram_init_data || req.headers['x-telegram-init-data'] || '';
   if (!initData) return res.json({ error: 'no_init_data' });
 
@@ -91,6 +148,7 @@ app.post('/debug_verify', (req, res) => {
   const calcHash = crypto.createHmac('sha256', secretKey).update(checkStr).digest('hex');
 
   res.json({
+    app: appKey,
     hash_from_tg: hash,
     hash_computed: calcHash,
     match: calcHash === hash,
@@ -113,17 +171,34 @@ function verifyBridgeSecret(req) {
 
 // ── POST /create_invoice ──────────────────────────────────────────────────────
 app.post('/create_invoice', async (req, res) => {
-  if (!BOT_TOKEN) return res.status(500).json({ success: false, error: 'BOT_TOKEN_not_set' });
+  const appKey = getAppKey(req);
+  const botToken = getBotTokenForApp(appKey);
+  if (!botToken) return res.status(500).json({ success: false, error: 'BOT_TOKEN_not_set', app: appKey });
 
-  const auth = verifyInitData(getInitData(req));
+  const auth = verifyInitData(getInitData(req), botToken);
   if (!auth.ok) return res.status(401).json({ success: false, error: auth.error });
 
-  const boostIndex = parseInt(req.body.boost_index ?? -1, 10);
-  if (boostIndex < 0 || boostIndex >= BOOST_STAR_PRICES.length)
-    return res.status(422).json({ success: false, error: 'invalid_boost_index' });
-
-  const starPrice = BOOST_STAR_PRICES[boostIndex];
   const label = String(req.body.title || 'Boost').slice(0, 32);
+  let prices;
+  const boostIndex = parseInt(req.body.boost_index ?? -1, 10);
+
+  if (boostIndex >= 0 && boostIndex < BOOST_STAR_PRICES.length) {
+    prices = [{ label, amount: BOOST_STAR_PRICES[boostIndex] }];
+  } else if (Array.isArray(req.body.prices) && req.body.prices.length > 0) {
+    prices = req.body.prices
+      .map((item) => {
+        const itemLabel = String(item?.label || label).slice(0, 32);
+        const amount = parseInt(item?.amount, 10);
+        if (!itemLabel || !(amount > 0)) return null;
+        return { label: itemLabel, amount };
+      })
+      .filter(Boolean);
+    if (!prices.length) {
+      return res.status(422).json({ success: false, error: 'invalid_prices' });
+    }
+  } else {
+    return res.status(422).json({ success: false, error: 'invalid_boost_index' });
+  }
 
   try {
     const result = await tgPost('createInvoiceLink', {
@@ -132,8 +207,8 @@ app.post('/create_invoice', async (req, res) => {
       payload: String(req.body.payload || `boost_${boostIndex}_${Date.now()}`).slice(0, 128),
       provider_token: '',
       currency: 'XTR',
-      prices: [{ label, amount: starPrice }],
-    });
+      prices,
+    }, botToken);
 
     if (!result.ok) return res.status(500).json({ success: false, error: 'telegram_error', description: result.description });
     res.json({ success: true, invoice_link: result.result });
@@ -144,32 +219,35 @@ app.post('/create_invoice', async (req, res) => {
 
 // ── POST /answer_precheckout ──────────────────────────────────────────────────
 app.post('/answer_precheckout', async (req, res) => {
-  if (!BOT_TOKEN) return res.status(500).json({ ok: false, error: 'BOT_TOKEN_not_set' });
+  const appKey = getAppKey(req);
+  const botToken = getBotTokenForApp(appKey);
+  if (!botToken) return res.status(500).json({ ok: false, error: 'BOT_TOKEN_not_set', app: appKey });
 
-  const auth = verifyInitData(getInitData(req));
+  const auth = verifyInitData(getInitData(req), botToken);
   if (!auth.ok) return res.status(401).json({ ok: false, error: auth.error });
 
   try {
+    const currentOffset = getOffsetForApp(appKey);
     const updates = await tgPost('getUpdates', {
-      offset: tgOffset,
+      offset: currentOffset,
       limit: 50,
       timeout: 0,
       allowed_updates: ['pre_checkout_query'],
-    });
+    }, botToken);
 
     if (!updates.ok) return res.status(500).json({ ok: false, error: 'getUpdates_failed' });
 
     let answered = 0;
-    let maxId = tgOffset - 1;
+    let maxId = currentOffset - 1;
 
     for (const upd of updates.result) {
       if (upd.update_id > maxId) maxId = upd.update_id;
       if (!upd.pre_checkout_query) continue;
-      await tgPost('answerPreCheckoutQuery', { pre_checkout_query_id: upd.pre_checkout_query.id, ok: true });
+      await tgPost('answerPreCheckoutQuery', { pre_checkout_query_id: upd.pre_checkout_query.id, ok: true }, botToken);
       answered++;
     }
 
-    if (maxId >= tgOffset) tgOffset = maxId + 1;
+    if (maxId >= currentOffset) setOffsetForApp(appKey, maxId + 1);
 
     res.json({ ok: true, answered, updates: updates.result.length });
   } catch (e) {
@@ -179,7 +257,9 @@ app.post('/answer_precheckout', async (req, res) => {
 
 // ── POST /send_message ────────────────────────────────────────────────────────
 app.post('/send_message', async (req, res) => {
-  if (!BOT_TOKEN) return res.status(500).json({ success: false, error: 'BOT_TOKEN_not_set' });
+  const appKey = getAppKey(req);
+  const botToken = getBotTokenForApp(appKey);
+  if (!botToken) return res.status(500).json({ success: false, error: 'BOT_TOKEN_not_set', app: appKey });
   if (!verifyBridgeSecret(req)) {
     return res.status(401).json({ success: false, error: 'bridge_secret_invalid' });
   }
@@ -202,7 +282,7 @@ app.post('/send_message', async (req, res) => {
   }
 
   try {
-    const result = await tgPost('sendMessage', payload);
+    const result = await tgPost('sendMessage', payload, botToken);
     if (!result.ok) {
       return res.status(500).json({
         success: false,
@@ -217,7 +297,11 @@ app.post('/send_message', async (req, res) => {
 });
 
 // ── health ────────────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ ok: true, service: 'hexdrop-tg-bridge' }));
+app.get('/', (req, res) => res.json({
+  ok: true,
+  service: 'hexdrop-tg-bridge',
+  apps: [...APP_BOT_TOKENS.keys()],
+}));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Bridge listening on port ${PORT}`));
